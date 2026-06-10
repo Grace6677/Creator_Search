@@ -1,6 +1,6 @@
 // Serverless function. Runs on Vercel.
 // Calls Google's Gemini API with Google Search grounding.
-// Your GEMINI_API_KEY is stored in Vercel environment variables, never in code.
+// Auto-retries on transient errors (503, 429).
 
 const SYSTEM = `You are a creator discovery agent for an Indian marketing agency. The user gives filter criteria. Use Google Search to find REAL Instagram creators in India that match.
 
@@ -35,37 +35,50 @@ function buildBrief(f) {
   return `Find up to ${n} Indian Instagram creators matching:\n${parts.join("\n")}`;
 }
 
-export default async function handler(req, res) {
-  if (req.method !== "POST") {
-    return res.status(405).json({ error: "Method not allowed" });
-  }
-  const key = process.env.GEMINI_API_KEY;
-  if (!key) {
-    return res.status(500).json({ error: "Server missing GEMINI_API_KEY" });
-  }
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-  const filters = req.body?.filters || {};
+async function callGemini(key, brief, attempt = 1) {
   const model = "gemini-2.5-flash";
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`;
 
+  const r = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "x-goog-api-key": key },
+    body: JSON.stringify({
+      systemInstruction: { parts: [{ text: SYSTEM }] },
+      contents: [{ role: "user", parts: [{ text: brief }] }],
+      tools: [{ google_search: {} }],
+      generationConfig: { maxOutputTokens: 4000, temperature: 0.3 },
+    }),
+  });
+
+  // Retry on transient errors: 503 (overloaded), 429 (rate limit), 500 (server)
+  if ((r.status === 503 || r.status === 429 || r.status === 500) && attempt < 4) {
+    const wait = 1000 * Math.pow(2, attempt - 1); // 1s, 2s, 4s
+    await sleep(wait);
+    return callGemini(key, brief, attempt + 1);
+  }
+
+  return r;
+}
+
+export default async function handler(req, res) {
+  if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
+  const key = process.env.GEMINI_API_KEY;
+  if (!key) return res.status(500).json({ error: "Server missing GEMINI_API_KEY" });
+
+  const filters = req.body?.filters || {};
+  const brief = buildBrief(filters);
+
   try {
-    const r = await fetch(url, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-goog-api-key": key,
-      },
-      body: JSON.stringify({
-        systemInstruction: { parts: [{ text: SYSTEM }] },
-        contents: [{ role: "user", parts: [{ text: buildBrief(filters) }] }],
-        tools: [{ google_search: {} }],
-        generationConfig: { maxOutputTokens: 4000, temperature: 0.3 },
-      }),
-    });
+    const r = await callGemini(key, brief);
 
     if (!r.ok) {
       const detail = await r.text();
-      return res.status(502).json({ error: `Gemini API error ${r.status}`, detail });
+      let msg = `Gemini API error ${r.status}`;
+      if (r.status === 503) msg += " — Google's servers are busy. Wait a minute and try again.";
+      if (r.status === 429) msg += " — daily free quota hit. Try again tomorrow or upgrade.";
+      return res.status(502).json({ error: msg, detail });
     }
 
     const data = await r.json();
